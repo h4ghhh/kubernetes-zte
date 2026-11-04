@@ -1,0 +1,139 @@
+# Run Kubernetes unit tests natively on riscv64 hardware
+#
+# Validates that the full unit-test suite passes on linux/riscv64.
+# `make test` runs gotestsum over the whole go workspace; results are
+# uploaded as artifacts (JUnit XML + log).
+#
+# The failure gate uses `make test`'s exit code as the primary signal and
+# greps the log as a fallback, so it stays correct even if gotestsum's
+# output symbols change between versions.
+
+name: Test riscv64
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'go.work'
+      - '.go-version'
+      - '.github/workflows/test-riscv64.yml'
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: 'Runner label (must be a native riscv64 host)'
+        required: false
+        default: 'ubuntu-24.04-riscv'
+  schedule:
+    # Weekly: Sunday at 04:00 UTC
+    - cron: '0 4 * * 0'
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04-riscv' }}
+    timeout-minutes: 180
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf _output/ || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install test prerequisites
+        run: |
+          # make test requires jq (kube::util::require-jq). gotestsum and
+          # prune-junit-xml are installed automatically from hack/tools / cmd.
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+      - name: Install Go
+        run: |
+          GO_VERSION=$(cat .go-version)
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-riscv64.tar.gz" \
+            | sudo tar -C /usr/local -xz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Go
+        run: |
+          go version
+          go env GOARCH  # should print riscv64
+
+      - name: Run unit tests
+        env:
+          # hack/make-rules/test.sh passes KUBE_TIMEOUT verbatim to go test,
+          # so it must include the -timeout= prefix (default: -timeout=180s).
+          KUBE_TIMEOUT: -timeout=3600s
+          # JUnit XML reports for the artifact upload; test.sh creates the dir.
+          KUBE_JUNIT_REPORT_DIR: _artifacts/junit
+        run: |
+          set -o pipefail
+          make test GOFLAGS="-count=1" 2>&1 | tee test-output.log
+          echo "${PIPESTATUS[0]}" > test-exit-code
+        continue-on-error: true
+
+      - name: Summarize results
+        if: always()
+        run: |
+          echo "## riscv64 Unit Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Strip ANSI color codes before counting
+          sed 's/\x1b\[[0-9;]*m//g' test-output.log > test-output-plain.log
+
+          # gotestsum package markers; fall back to raw go-test FAIL markers
+          passed=$(grep -c "^✓" test-output-plain.log || true)
+          failed=$(grep -c "^✗" test-output-plain.log || true)
+          empty=$(grep -c "^∅" test-output-plain.log || true)
+          gofail=$(grep -c -- "--- FAIL" test-output-plain.log || true)
+          total=$((passed + failed + empty))
+
+          echo "| Metric | Count |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Passed | ${passed} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Failed | ${failed} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Empty  | ${empty} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Total  | ${total} |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${gofail}" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Failing tests" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -- "--- FAIL" test-output-plain.log | head -50 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-unit-test-log
+          path: test-output.log
+          retention-days: 90
+
+      - name: Upload JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-unit-test-junit
+          path: _artifacts/junit
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Check for failures
+        run: |
+          exit_code=$(cat test-exit-code 2>/dev/null || echo 1)
+          sed 's/\x1b\[[0-9;]*m//g' test-output.log > test-output-plain.log
+          failed=$(grep -c "^✗" test-output-plain.log || true)
+          gofail=$(grep -c -- "--- FAIL" test-output-plain.log || true)
+          if [ "${exit_code}" -ne 0 ] || [ "${failed}" -gt 0 ] || [ "${gofail}" -gt 0 ]; then
+            echo "::error::riscv64 unit tests failed: make test exit=${exit_code}, ${failed} failed package(s), ${gofail} failing test(s)"
+            exit 1
+          fi
